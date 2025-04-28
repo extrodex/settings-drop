@@ -1,0 +1,348 @@
+
+using System.ComponentModel;
+using System.Diagnostics.Tracing;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Text;
+
+
+
+public class GameServer{
+    //game settings variables
+    string keybindUP="W";
+    string keybindDOWN="S";
+    string keybindLEFT="A";
+    string keybindRIGHT="D";
+    string skin="⍨";
+    // Constants for maze dimensions and server port
+
+    private int[] dims;
+    private const int PORT = 5004;
+    private const char Goal = '⍝';
+    // Game state variables // Stores the maze layout
+    private char[,] maze;
+    private Dictionary<string, (int x, int y)> players;           // Tracks player positions by username
+    private List<string> messages;                                // Chat message history
+    private object lockObject;                                    // For thread-safe operations
+    //server file variables
+    private const string CREDENTIALS_FILE = "players.txt";
+    public GameServer(){
+        // Initialize game state
+        players = new Dictionary<string, (int x, int y)>();
+        messages = new List<string>();
+        lockObject = new object();
+        InitializeLevel(1);
+    }
+    public Random random = new();
+    private void InitializeLevel(int level){
+        string[] lines = File.ReadAllLines(string.Concat("level",level,".txt"));                       // Read level from file
+        dims = [int.Parse(lines[0].Split(",")[0]),int.Parse(lines[0].Split(",")[1])];     //1st line of level code holds dimensions of level this converts that to an array in (x,y) format
+        maze = new char[dims[0],dims[1]];
+        for (int y = 1; y < dims[1]; y++) {
+            for (int x = 0; x < dims[0]; x++) {
+                maze[x, y] = lines[y][x];
+            }
+        }
+    }
+    private void FoundUnvisited(bool[,] visited,int[,] nextDirection,int currentX,int currentY){
+        // Perform a random walk until we hit a visited cell
+        int walkX = currentX;
+        int walkY = currentY;
+        while (!visited[walkX, walkY]){
+            int[] dx = { 0, 2, 0, -2};
+            int[] dy = { -2, 0, 2, 0};
+            int dir = random.Next(4);
+
+            int newX = walkX + dx[dir];
+            int newY = walkY + dy[dir];
+
+            if (newX > 0 && newX < dims[0] - 1 && newY > 0 && newY < dims[1] - 1){
+                nextDirection[walkX, walkY] = dir;
+                walkX = newX;
+                walkY = newY;
+            }
+        }
+
+        // Carve the path
+        walkX = currentX;
+        walkY = currentY;
+        while (!visited[walkX, walkY]){
+            visited[walkX, walkY] = true;
+            int dir = nextDirection[walkX, walkY];
+            int[] dx = { 0, 2, 0, -2 };
+            int[] dy = { -2, 0, 2, 0 };
+            
+            // Carve the path and the cell in between
+            maze[walkX, walkY] = ' ';
+            maze[walkX + dx[dir]/2, walkY + dy[dir]/2] = ' ';
+            
+            walkX += dx[dir];
+            walkY += dy[dir];
+        }
+    }
+    private string GetGameState()
+    {
+        // Create a copy of the maze to avoid modifying the original
+        var state = new char[dims[0], dims[1]];
+        Array.Copy(maze, state, maze.Length);
+        // Add all players to the maze copy
+        lock (lockObject)
+        {
+            foreach (var player in players)
+            {
+                state[player.Value.x, player.Value.y] = player.Key[0].ToString().ToUpper()[0];
+            }
+        }
+
+        // Convert maze to string representation
+        var strmaze = new StringBuilder();
+        for (int y = 0; y < dims[1]; y++){
+            for (int x = 0; x < dims[0]; x++){
+                strmaze.Append(state[x, y]);
+            }
+            strmaze.AppendLine();
+        }
+
+        // Add recent chat messages
+        strmaze.AppendLine("\nChat:");
+        lock (lockObject){
+            foreach (var msg in messages.Skip(Math.Max(0, messages.Count - 5))){
+                strmaze.AppendLine(msg);
+            }
+        }
+        return strmaze.ToString();
+    }
+
+    public async Task Start()
+    {
+        // Start TCP listener on specified port
+        var listener = new TcpListener(IPAddress.Parse("0.0.0.0"), PORT);
+        listener.Start();
+        // Get the computer's host name (machine name)
+        string hostName = Dns.GetHostName();
+        
+        // Get all IP addresses associated with this machine
+        IPAddress[] addresses = Dns.GetHostAddresses(hostName);
+        
+        // Find the first IPv4 address, or default to 0.0.0.0 if none found
+        // AddressFamily.InterNetwork specifically filters for IPv4 addresses
+        string ipAddress = addresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? "0.0.0.0";
+        
+        // Display both IP address and port number
+        Console.WriteLine($"Server started on {ipAddress}:{PORT}");
+
+        // Accept new clients continuously
+        while (true)
+        {
+            TcpClient client = await listener.AcceptTcpClientAsync();
+            _ = HandleClient(client);  // Handle each client in separate task
+        }
+    }
+
+    private async Task HandleClient(TcpClient client)
+    {
+        var stream = client.GetStream();
+        string username = "";
+        try
+        {
+       	// Get player's credentials
+       	var buffer = new byte[1024];
+       	var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+       	var credentials = Encoding.UTF8.GetString(buffer, 0, bytesRead).Split('|');
+
+       	if (credentials.Length != 3)
+       	{
+           	await SendMessage(client, "Invalid credentials format");
+           	return;
+       	}
+        bool login = false;
+        if (string.Equals(credentials[0], "true")){
+            login = true;
+        }
+        if (string.Equals(credentials[0], "false")){
+            login = false;
+        }
+
+       	username = credentials[1].Trim();
+       	string password = credentials[2].Trim();
+
+       	if (!ValidateCredentials(login, username, password)){
+           	await SendMessage(client, "Invalid username or password");
+           	return;
+       	}
+
+
+        Console.WriteLine($"{username} has joined the game!");
+
+        // Add player to game at starting position
+        lock (lockObject)
+        {
+            players[username] = (5, dims[1]-2);
+
+            messages.Add($"* {username} joined the game *");
+        }
+        _ = SendGameState(client);
+        // Main game loop for this client
+        while (true)
+        {
+            // Get and process client input
+            buffer = new byte[32];
+            bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+            if (bytesRead == 0) break;  // Client disconnected
+            var input = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+            if (!string.IsNullOrEmpty(input)){
+                HandlePlayerInput(username, input);
+            }
+        }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+        finally
+        {
+            // Clean up when client disconnects
+            lock (lockObject)
+            {
+                players.Remove(username);
+                messages.Add($"* {username} left the game *");
+            }
+            client.Close();
+        }
+    }
+
+    private void HandlePlayerInput(string username, string input)
+    {
+
+        lock (lockObject)
+        {
+            var (x, y) = players[username];
+            
+            // Handle chat messages
+            if (input.StartsWith("/msg "))
+            {
+                messages.Add($"[{DateTime.Now:HH:mm:ss}] {username}: {input.Substring(5)}");
+                return;
+            }
+
+            // Handle movement
+            int newX = x;
+            int newY = y;
+            int[] dir ;
+            switch (input.ToUpper())
+            {
+                case "W": newY--; dir = new int[] {0,-1}; break;  // Move up
+                case "S": newY++; dir = new int[] {0,1}; break;  // Move down
+                case "A": newX--; dir = new int[] {-1,0}; break;  // Move left
+                case "D": newX++; dir = new int[] {1,0}; break;  // Move right
+            }
+
+            // Update position if move is valid
+            if (maze[newX, newY] != '█' || maze[newX, newY] != '▢')
+            {
+                if (maze[newX,newY] == '⊠'){
+                    if (maze[newX+ dir[0],newY] != '█'){
+                        maze[newX,newY] = '⊠';
+                        maze[newX,newY] = ' ';
+                    }
+                }
+                else{
+                    players[username] = (newX, newY);
+                }
+                // Check if player reached goal
+                if (maze[newX, newY] == Goal){
+                    messages.Add($"*** {username} reached the goal! ***");
+                    InitializeLevel(2);
+                    players[username] = (5, dims[1]-2);
+
+                }
+            }
+        }
+    }
+    private async Task SendGameState(TcpClient client) {
+        while (true){
+            // Send current game state to client
+            var gameState = GetGameState();
+            var stream = client.GetStream();
+            byte[] stateData = Encoding.UTF8.GetBytes(gameState);
+            await stream.WriteAsync(stateData, 0, stateData.Length);        
+            await Task.Delay(42);
+        }
+    }
+
+    static async Task Main(){
+        var server = new GameServer();
+        await server.Start();
+    }
+    private bool ValidateCredentials(bool login, string username, string password){
+        if (!File.Exists(CREDENTIALS_FILE)) {
+            SaveCredentials(username, password);
+            return true;
+        }
+
+        if (login){
+            var lines = File.ReadAllLines(CREDENTIALS_FILE);
+            foreach (var line in lines){
+                var parts = line.Split('|');
+                if (parts[0] == username){
+                    return parts[0] == HashPassword(password);
+                }
+            }
+            login = false;
+        }
+        if (!login){
+            SaveCredentials(username, password);
+            Console.WriteLine("Default keybinds for movment are WASD, would you like to change them? y/n");
+            string kbindcheck = Console.ReadLine().ToLower();
+            bool changing=false;
+            if (kbindcheck=="y"){
+                changing=true;
+                while (changing){
+                Console.WriteLine($"What input would you like to change? {keybindUP}, {keybindDOWN}, {keybindLEFT}, {keybindRIGHT}");
+                kbindcheck=Console.ReadLine().Substring(0,1);
+                Console.WriteLine("What is the new key?");
+                string newkbind=Console.ReadLine().Substring(0,1);
+
+                if (keybindUP==kbindcheck.ToLower()){
+                    keybindUP=newkbind;
+                } else if (keybindDOWN==kbindcheck.ToLower()){
+                    keybindDOWN=newkbind;
+                } else if (keybindLEFT==kbindcheck.ToLower()){
+                    keybindLEFT=newkbind;
+                } else if (keybindRIGHT==kbindcheck.ToLower()){
+                    keybindRIGHT=newkbind;
+                } else {
+                    Console.WriteLine("An invalid input has been made, please try again");
+                }
+                Console.WriteLine("Change another input? y/n");
+                string joe = Console.ReadLine();
+                if (joe.ToLower()=="n"){
+                    changing=false;
+                }
+                }
+            }
+        }
+        return true;
+   }
+
+   private void SaveCredentials(string username, string password){
+        var hashedPassword = HashPassword(password);
+        File.AppendAllText(CREDENTIALS_FILE, $"{username}|{hashedPassword}\n");
+   }
+
+   private string HashPassword(string password){
+   	    var sha256 = System.Security.Cryptography.SHA256.Create();
+        var hashedBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password));
+       	return Convert.ToBase64String(hashedBytes);
+   }
+
+   private async Task SendMessage(TcpClient client, string message)
+   {
+   	var stream = client.GetStream();
+   	var messageBytes = Encoding.UTF8.GetBytes(message);
+   	await stream.WriteAsync(messageBytes, 0, messageBytes.Length);
+   }
+
+}
